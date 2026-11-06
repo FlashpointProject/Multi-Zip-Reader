@@ -1,33 +1,36 @@
 import * as fs from 'node:fs';
 import { ReadStream } from 'node:fs';
+import { FileHandle } from 'node:fs/promises';
 import * as path from 'node:path';
-import v8 from 'node:v8';
 import { crc32, createInflate, createInflateRaw } from 'node:zlib';
 
 const CUR_VERSION = 0;
 
 interface ArchiveDataManager {
-  sources: ArchiveDataSource[];
+  sources: Record<string, ArchiveDataSourceInfo>;
   loadArchive(filePath: string): Promise<ArchiveDataSource>;
   readFile(filePath: string): Promise<Buffer | null>;
   readFileStream(filePath: string): Promise<ReadStream | null>;
 }
 
 type ArchiveDataSource = {
-  mzrVersion: number;
   path: string;
   size: number;
-  data: Record<string, ArchiveDataFile>;
+  data: Record<string, CompactArchiveDataFile>;
 }
 
-type ArchiveDataFile = {
-  crc32: number;
-  fileHeaderOffset: number;
-  length: number;
+type ArchiveDataSourceInfo = {
+  path: string;
+  size: number;
+  fileCount: number;
 }
+
+// [length, crc32, fileHeaderOffset, sourceId]
+type CompactArchiveDataFile = [number, number, number, number];
 
 type ZipDataOffset = {
   filePath: string;
+  name: string;
   crc32: number;
   offset: number;
   compressionMethod: number; // 0 = Store, 8 = Deflate
@@ -35,79 +38,159 @@ type ZipDataOffset = {
   length: number;
 }
 
-export class FpArchiveDataManager implements ArchiveDataManager {
-  sources: ArchiveDataSource[] = [];
+export type PathTreeNode = {
+  files?: Map<number, CompactArchiveDataFile>;
+  children?: Map<string, PathTreeNode>;
+};
 
-  async loadDirectory(dirPath: string, cache = false): Promise<void> {
-    for (const file of fs.readdirSync(dirPath, { withFileTypes: true }).filter(f => f.isFile() && f.name.endsWith('.zip'))) {
-      await this.loadArchive(path.join(dirPath, file.name), false);
+export class FpArchiveDataManager implements ArchiveDataManager {
+  sources: Record<number, ArchiveDataSourceInfo> = {};
+  nextSourceId = 0;
+  pathTree: PathTreeNode = {};
+
+  async loadDirectory(dirPath: string, concurrency: number = 1, cache = false, recursiveMatcher?: (filename: string) => boolean): Promise<void> {
+    const files = fs.readdirSync(dirPath, { withFileTypes: true }).filter(f => f.isFile() && f.name.endsWith('.zip'));
+    for (let i = 0; i < files.length; i += concurrency) {
+      const batch = files.slice(i, i + concurrency);
+      await Promise.all(batch.map(async (file) => {
+        try {
+          await this.loadArchive(path.join(dirPath, file.name), false, recursiveMatcher);
+        } catch (err: any) {
+          console.error(err.message);
+        }
+      }));
     }
   }
 
-  async loadArchive(filePath: string, cache = false): Promise<ArchiveDataSource> {
-    const archiveData: Record<string, ArchiveDataFile> = {};
+  async loadArchive(filePath: string, cache = false, recursiveMatcher?: (filename: string) => boolean): Promise<ArchiveDataSource> {
+    const archiveData: Record<string, CompactArchiveDataFile> = {};
 
-    for (const source of this.sources) {
-      if (source.path === filePath) {
-        throw new Error('Archive already loaded');
-      }
+    const sourceId = this.nextSourceId++;
+    if (filePath in this.sources) {
+      throw new Error('Archive already loaded');
     }
-
-    const fileExt = path.extname(filePath);
-    const indexFilePath = filePath.substring(0, filePath.length - fileExt.length) + '.mzrindex';
 
     // Read archive metadata
     const fd = await fs.promises.open(filePath, 'r');
     const stats = await fd.stat();
     const fileSize = stats.size;
 
-    if (cache) {
-      try {
-        // Try and load cache
-        const buffer = await fs.promises.readFile(indexFilePath);
-        const cachedArchive = v8.deserialize(buffer);
-        if (cachedArchive.size === fileSize && cachedArchive.mzrVersion === CUR_VERSION) {
-          this.sources.push(cachedArchive);
-          await fd.close();
-          return cachedArchive;
-        }
-      } catch {
-        // Could not read cache, just carry on
-      }
-    }
-
     const archive: ArchiveDataSource = {
-      mzrVersion: CUR_VERSION,
       path: filePath,
       size: fileSize,
       data: archiveData,
     };
 
     // Read the central directory at the end of the file
-    const bufferSize = 1024;
-    const buffer = Buffer.alloc(bufferSize);
-    const readSize = Math.min(bufferSize, fileSize);
+    await this.parseZipRange(fd, filePath, fileSize, 0, archiveData, filePath, sourceId, recursiveMatcher)
+      .finally(() => fd.close());
 
-    await fd.read(buffer, 0, readSize, fileSize - readSize);
+    this.sources[sourceId] = {
+      path: filePath,
+      size: fileSize,
+      fileCount: Object.keys(archive.data).length
+    };
+    this._buildIndexForSource(archive, sourceId);
 
-    // Find end of central directory record
+    return archive;
+  }
 
+  private _buildIndexForSource(source: ArchiveDataSource, sourceId: number) {
+    for (const [fileName, fileInfo] of Object.entries(source.data)) {
+      const parts = fileName.split('/');
+      let node = this.pathTree;
+
+      // Navigate/create tree structure
+      for (let i = 0; i < parts.length - 1; i++) {
+        const part = parts[i]!;
+        if (!node.children) {
+          node.children = new Map();
+        }
+
+        let child = node.children.get(part);
+        if (!child) {
+          child = {};
+          node.children.set(part, child);
+        }
+        node = child;
+      }
+
+      // Store file at leaf
+      const filename = parts[parts.length - 1]!;
+      if (!node.children) {
+        node.children = new Map();
+      }
+
+      let fileNode = node.children.get(filename);
+      if (!fileNode) {
+        fileNode = { files: new Map() };
+        node.children.set(filename, fileNode);
+      }
+
+      if (!fileNode.files) {
+        fileNode.files = new Map();
+      }
+
+      fileNode.files.set(sourceId, fileInfo);
+    }
+  }
+
+  async parseZipRange(fd: FileHandle, filePath: string, fileSize: number, fileOffset: number, archiveData: Record<string, CompactArchiveDataFile>, parentFilename: string, sourceId: number, recursiveMatcher?: (filename: string) => boolean): Promise<void> {
+    const INITIAL_READ_SIZE = 2048;
+    const MAX_COMMENT_SIZE = 65535;
+    const EOCD_SIZE = 22;
+
+    // Read initial buffer
+    const initialSize = Math.min(INITIAL_READ_SIZE, fileSize);
+    let readSize = initialSize;
+    let buffer = Buffer.allocUnsafe(initialSize);
+
+    await fd.read(buffer, 0, initialSize, fileOffset + (fileSize - initialSize));
+
+    // Search from end (most likely position)
     let eocdPos = -1;
-    for (let i = buffer.length - 4; i >= 0; i--) {
+    for (let i = buffer.length - EOCD_SIZE; i >= 0; i--) {
       if (buffer.readUInt32LE(i) === 0x06054b50) {
-        eocdPos = fileSize - readSize + i;
+        eocdPos = fileOffset + (fileSize - initialSize) + i;
         break;
       }
     }
 
+    // If not found, expand search
+    if (eocdPos === -1 && fileSize > INITIAL_READ_SIZE) {
+      const fullSize = Math.min(EOCD_SIZE + MAX_COMMENT_SIZE, fileSize);
+      readSize = fullSize;
+
+      // Only read the additional data we haven't read yet
+      const additionalSize = fullSize - initialSize;
+      const additionalBuffer = Buffer.allocUnsafe(additionalSize);
+
+      await fd.read(additionalBuffer, 0, additionalSize, fileOffset + (fileSize - fullSize));
+
+      // Combine buffers
+      buffer = Buffer.concat([additionalBuffer, buffer]);
+
+      // Search only the new portion (we already searched the end)
+      for (let i = additionalSize - 4; i >= 0; i--) {
+        if (buffer.readUInt32LE(i) === 0x06054b50) {
+          eocdPos = fileOffset + (fileSize - fullSize) + i;
+          break;
+        }
+      }
+    }
+
     if (eocdPos === -1) {
-      throw new Error('Invalid ZIP file: End of central directory not found');
+      if (filePath === parentFilename) {
+        throw new Error(`ZIP: End of central directory not found for ${filePath}`);
+      } else {
+        throw new Error(`ZIP: End of central directory not found for ${parentFilename} in ${filePath}`);
+      }
     }
 
     const eocdBuffer = Buffer.alloc(22);
     await fd.read(eocdBuffer, 0, 22, eocdPos);
 
-    const centralDirOffset = eocdBuffer.readUInt32LE(16); // Offset to start of central directory
+    const centralDirOffset = fileOffset + eocdBuffer.readUInt32LE(16); // Offset to start of central directory
     const isZip64 = centralDirOffset === 0xffffffff;
     const entryCount = eocdBuffer.readUInt16LE(10); // Number of records
     const centralDirSize = eocdBuffer.readUInt32LE(12); // Size of central directory in bytes
@@ -116,13 +199,17 @@ export class FpArchiveDataManager implements ArchiveDataManager {
       let eocd64Pos = -1;
       for (let i = buffer.length - 4; i >= 0; i--) {
         if (buffer.readUInt32LE(i) === 0x06064b50) {
-          eocd64Pos = fileSize - readSize + i;
+          eocd64Pos = fileOffset + (fileSize - readSize) + i;
           break;
         }
       }
 
       if (eocd64Pos === -1) {
-        throw new Error('Invalid ZIP64 file: End of central directory not found');
+        if (filePath === parentFilename) {
+          throw new Error(`ZIP64: End of central directory not found for ${filePath}`);
+        } else {
+          throw new Error(`ZIP64: End of central directory not found for ${parentFilename} in ${filePath}`);
+        }
       }
 
 
@@ -130,7 +217,7 @@ export class FpArchiveDataManager implements ArchiveDataManager {
       await fd.read(eocd64Buffer, 0, 56, eocd64Pos);
 
       const centralDir64Size = eocd64Buffer.readBigUint64LE(40);
-      const centralDir64Offset = eocd64Buffer.readBigUint64LE(48);
+      const centralDir64Offset = BigInt(fileOffset) + eocd64Buffer.readBigUint64LE(48);
 
       const chunkSize = 64 * 1024; // 64kb chunks
       let remainingBuffer = Buffer.alloc(0); // Buffer to hold partial records from previous chunk
@@ -153,7 +240,11 @@ export class FpArchiveDataManager implements ArchiveDataManager {
         while (pos + 46 <= cdBuffer.length) {
           // Check for valid central directory signature
           if (cdBuffer.readUInt32LE(pos) !== 0x02014b50) {
-            throw new Error(`Bad file header signature for ${filePath} got 0x${cdBuffer.readUInt32LE(pos).toString(16)}`);
+            if (filePath === parentFilename) {
+              throw new Error(`Bad file header signature for ${filePath} got 0x${cdBuffer.readUInt32LE(pos).toString(16)}`);
+            } else {
+              throw new Error(`Bad file header signature for ${parentFilename} in ${filePath} got 0x${cdBuffer.readUInt32LE(pos).toString(16)}`);
+            }
           }
           
           const crc32 = cdBuffer.readUInt32LE(pos + 16);
@@ -190,15 +281,35 @@ export class FpArchiveDataManager implements ArchiveDataManager {
             zip64Pos += 8;
           }
           if (fileHeaderOffset === 0xffffffff) {
-            fileHeaderOffset = Number(cdBuffer.readBigUInt64LE(pos + 46 + nameLength + zip64Pos));
+            fileHeaderOffset = fileOffset + Number(cdBuffer.readBigUInt64LE(pos + 46 + nameLength + zip64Pos));
             zip64Pos += 8;
           }
 
           const fileName = cdBuffer.toString('utf8', pos + 46, pos + 46 + nameLength);
-          archiveData[fileName] = {
-            crc32,
+          archiveData[fileName] = [
             length,
+            crc32,
             fileHeaderOffset,
+            sourceId,
+          ];
+
+          if (recursiveMatcher) {
+            if (fileName.toLowerCase().endsWith('.zip') && recursiveMatcher(fileName)) {
+              const compressionMethod = cdBuffer.readUint16LE(pos + 10);
+              // Only parse uncompressed zips
+              if (compressionMethod === 0) {
+                const lfhLengthsBuffer = Buffer.alloc(4);
+                await fd.read(lfhLengthsBuffer, 0, 4, fileHeaderOffset + 26);
+                const lfhNameLength = lfhLengthsBuffer.readUInt16LE(0);
+                const lfhExtraFieldLength = lfhLengthsBuffer.readUInt16LE(2);
+                const dataOffset = fileHeaderOffset + 30 + lfhNameLength + lfhExtraFieldLength;
+                try {
+                  await this.parseZipRange(fd, filePath, length, dataOffset, archiveData, fileName, sourceId);
+                } catch (err: any) {
+                  console.error(err.message);
+                }
+              }
+            }
           }
           
           pos += recordSize;
@@ -213,75 +324,92 @@ export class FpArchiveDataManager implements ArchiveDataManager {
       }      
 
     } else {
-      const cdBuffer = Buffer.alloc(centralDirSize);
-      await fd.read(cdBuffer, 0, centralDirSize, centralDirOffset);
+      const chunkSize = 64 * 1024; // 64kb chunks
+      let remainingBuffer = Buffer.alloc(0); // Buffer to hold partial records from previous chunk
+      let processedBytes = 0;
 
-      let pos = 0;
-      while (pos + 46 <= cdBuffer.length) {
-        if (cdBuffer.readUint32LE(pos) !== 0x02014b50) {
-          throw new Error('Bad file header signature');
+      while (processedBytes < centralDirSize) {
+        // Read next chunk of central directory
+        const bytesLeft = (centralDirSize - processedBytes);
+        const readSize = bytesLeft > BigInt(chunkSize) ? chunkSize : Number(bytesLeft);
+        const newChunk = Buffer.alloc(readSize);
+
+        await fd.read(newChunk, 0, readSize, (centralDirOffset + processedBytes));
+        processedBytes += readSize;
+
+        // Combine remaining buffer from previous chunk with new chunk
+        const cdBuffer = Buffer.concat([remainingBuffer, newChunk]);
+        let pos = 0;
+        let recordSize = 0;
+
+        while (pos + 46 <= cdBuffer.length) {
+          if (cdBuffer.readUint32LE(pos) !== 0x02014b50) {
+            if (filePath === parentFilename) {
+              throw new Error(`Bad file header signature for ${filePath} got 0x${cdBuffer.readUInt32LE(pos).toString(16)}`);
+            } else {
+              throw new Error(`Bad file header signature for ${parentFilename} in ${filePath} got 0x${cdBuffer.readUInt32LE(pos).toString(16)}`);
+            }
+          }
+
+          const nameLength = cdBuffer.readUInt16LE(pos + 28);
+          const extraFieldLength = cdBuffer.readUInt16LE(pos + 30);
+          const fileCommentLength = cdBuffer.readUInt16LE(pos + 32);
+          const externAttributes = cdBuffer.readUInt16LE(pos + 38);
+
+          if ((externAttributes & 0x10) || ((externAttributes >> 16) & 0o040000)) {
+            // Is directory, skip
+            pos += 46 + nameLength + extraFieldLength + fileCommentLength;
+            continue;
+          }
+
+          recordSize = 46 + nameLength + extraFieldLength + fileCommentLength;
+
+          // Check if we have the complete record in the buffer
+          if (pos + recordSize > cdBuffer.length) {
+            break;
+          }
+
+          const crc32 = cdBuffer.readUInt32LE(pos + 16);
+          const length = cdBuffer.readUint32LE(pos + 24);
+          const fileHeaderOffset = fileOffset + cdBuffer.readUInt32LE(pos + 42);
+          const fileName = cdBuffer.toString('utf8', pos + 46, pos + 46 + nameLength);
+          archiveData[fileName] = [
+            length,
+            crc32,
+            fileHeaderOffset,
+            sourceId,
+          ];
+
+          if (recursiveMatcher) {
+            if (fileName.toLowerCase().endsWith('.zip') && recursiveMatcher(fileName)) {
+              const compressionMethod = cdBuffer.readUint16LE(pos + 10);
+              // Only parse uncompressed zips
+              if (compressionMethod === 0) {
+                const lfhLengthsBuffer = Buffer.alloc(4);
+                await fd.read(lfhLengthsBuffer, 0, 4, fileHeaderOffset + 26);
+                const lfhNameLength = lfhLengthsBuffer.readUInt16LE(0);
+                const lfhExtraFieldLength = lfhLengthsBuffer.readUInt16LE(2);
+                const dataOffset = fileHeaderOffset + 30 + lfhNameLength + lfhExtraFieldLength;
+                try {
+                  await this.parseZipRange(fd, filePath, length, dataOffset, archiveData, fileName, sourceId);
+                } catch (err: any) {
+                  console.error(err.message);
+                }
+              }
+            }
+          }
+
+          pos += recordSize;
         }
 
-        const nameLength = cdBuffer.readUInt16LE(pos + 28);
-        const extraFieldLength = cdBuffer.readUInt16LE(pos + 30);
-        const fileCommentLength = cdBuffer.readUInt16LE(pos + 32);
-        const externAttributes = cdBuffer.readUInt16LE(pos + 38);
-        
-        if ((externAttributes & 0x10) || ((externAttributes >> 16) & 0o040000)) {
-          // Is directory, skip
-          pos += 46 + nameLength + extraFieldLength + fileCommentLength;
-          continue;
+        // If we processed all records in this buffer, clear the remaining buffer
+        if (pos + 46 > cdBuffer.length || pos + recordSize > cdBuffer.length) {
+          remainingBuffer = cdBuffer.subarray(pos);
+        } else {
+          remainingBuffer = Buffer.alloc(0);
         }
-
-        const crc32 = cdBuffer.readUInt32LE(pos + 16);
-        const length = cdBuffer.readUint32LE(pos + 24);
-        const fileHeaderOffset = cdBuffer.readUInt32LE(pos + 42);
-        const fileName = cdBuffer.toString('utf8', pos + 46, pos + 46 + nameLength);
-        archiveData[fileName] = {
-          crc32,
-          length,
-          fileHeaderOffset,
-        }
-
-        pos += 46 + nameLength + extraFieldLength + fileCommentLength;
       }
-
     }
-
-    await fd.close();
-
-    this.sources.push(archive);
-    if (cache) {
-      await this.writeCache(indexFilePath, archive);
-    }
-
-    return archive;
-  }
-
-  async writeCache(cacheFilePath: string, source: ArchiveDataSource) {
-    const buffer = v8.serialize(source);
-    await fs.promises.writeFile(cacheFilePath, buffer);
-  }
-
-  async _createStreamFromOffset(zipDataOffset: ZipDataOffset): Promise<ReadStream | null> {
-    if (zipDataOffset.length === 0) {
-      return null;
-    }
-
-    const stream = fs.createReadStream(zipDataOffset.filePath, {
-      start: zipDataOffset.offset,
-      end: Number(zipDataOffset.offset + zipDataOffset.compressedLength) - 1
-    });
-
-    // Pipe deflated data through inflate stream
-    if (zipDataOffset.compressionMethod === 8) {
-      const inflateStream = createInflateRaw();
-      stream.pipe(inflateStream);
-      return inflateStream as unknown as ReadStream;
-    }
-
-    // Store, pipe back raw data
-    return stream;
   }
 
   async readFile(filePath: string): Promise<Buffer | null> {
@@ -290,7 +418,7 @@ export class FpArchiveDataManager implements ArchiveDataManager {
       throw createENOENTError(filePath);
     }
 
-    const stream = await this._createStreamFromOffset(zipDataOffset);
+    const stream = await createStreamFromOffset(zipDataOffset);
     if (stream === null) {
       return null;
     }
@@ -328,76 +456,35 @@ export class FpArchiveDataManager implements ArchiveDataManager {
       throw createENOENTError(filePath);
     }
     
-    return this._createStreamFromOffset(zipDataOffset);
+    return createStreamFromOffset(zipDataOffset);
   }
 
   async getZipDataOffset(filePath: string): Promise<ZipDataOffset | null> {
-    let fileInfo: ArchiveDataFile | undefined = undefined;
-    let source: ArchiveDataSource | undefined = undefined;
-    for (const s of this.sources) {
-      fileInfo = s.data[filePath];
-      if (fileInfo !== undefined) {
-        source = s;
-        break;
-      } 
+    const parts = filePath.split('/');
+    let node: PathTreeNode = this.pathTree;
+
+    // Navigate tree
+    for (const part of parts) {
+      if (!node.children) return null;
+      const child = node.children.get(part);
+      if (!child) return null;
+      node = child;
     }
-    if (fileInfo === undefined || source === undefined) {
+
+    // Get first file entry
+    if (!node.files || node.files.size === 0) {
       return null;
     }
-    if (fileInfo !== undefined) {
-      if (fileInfo.length === 0) {
-        return {
-          filePath: source.path,
-          crc32: fileInfo.crc32,
-          offset: 0,
-          compressionMethod: 0,
-          compressedLength: 0,
-          length: 0
-        }
-      }
 
-      // Read local file header
-      const fd = await fs.promises.open(source.path, 'r');
-      const lfhBuffer = Buffer.alloc(30);
-      await fd.read(lfhBuffer, 0, 30, fileInfo.fileHeaderOffset);
+    const [sourceIndex, fileInfo] = node.files.entries().next().value!;
+    const source = this.sources[sourceIndex]!;
 
-      const compressionMethod = lfhBuffer.readUint16LE(8);
-      let compressedLength = lfhBuffer.readUInt32LE(18);
-      let length = lfhBuffer.readUInt32LE(22);
-      const nameLength = lfhBuffer.readUint16LE(26);
-      const extraFieldLength = lfhBuffer.readUInt16LE(28);
+    const fd = await fs.promises.open(source.path, 'r');
+    return parseZipDataOffset(fd, source.path, fileInfo)
+      .finally(() => {
+        fd.close();
+      });
 
-      if (length === 0xFFFFFFFF || compressedLength === 0xFFFFFFFF) {
-        let zip64Pos = 4;
-        const zip64Buffer = Buffer.alloc(extraFieldLength);
-        await fd.read(zip64Buffer, 0, extraFieldLength, fileInfo.fileHeaderOffset + 30 + nameLength);
-
-        if (length === 0xFFFFFFFF) {
-          length = Number(zip64Buffer.readBigUInt64LE(zip64Pos));
-          zip64Pos += 8;
-        }
-
-        if (compressedLength === 0xFFFFFFFF) {
-          compressedLength = Number(zip64Buffer.readBigUInt64LE(zip64Pos));
-          zip64Pos += 8;
-        }
-      }
-      console.log(`Method: ${compressionMethod} - Comp Length: ${compressedLength} - Length: ${length}`);
-
-      const trueOffset = fileInfo.fileHeaderOffset + 30 + nameLength + extraFieldLength;
-      await fd.close();
-
-      // Just read the field sizes so we can get the accurate start point
-
-      return {
-        filePath: source.path,
-        crc32: fileInfo.crc32,
-        compressionMethod,
-        compressedLength,
-        length,
-        offset: trueOffset,
-      }
-    }
     return null;
   }
 }
@@ -475,3 +562,83 @@ function createENOENTError(path: string) {
 // 46	n	File name.
 // 46+n	m	Extra field.
 // 46+n+m	k	File comment.
+export async function parseZipDataOffset(fd: FileHandle, sourcePath: string, fileInfo: CompactArchiveDataFile): Promise<ZipDataOffset> {
+  const [fileLength, crc32, fileHeaderOffset] = fileInfo;
+
+  // Read local file header
+  const lfhBuffer = Buffer.alloc(30);
+  await fd.read(lfhBuffer, 0, 30, fileHeaderOffset);
+
+  const compressionMethod = lfhBuffer.readUint16LE(8);
+  let compressedLength = lfhBuffer.readUInt32LE(18);
+  let length = lfhBuffer.readUInt32LE(22);
+  const nameLength = lfhBuffer.readUint16LE(26);
+  const extraFieldLength = lfhBuffer.readUInt16LE(28);
+
+  const nameBuffer = Buffer.alloc(nameLength);
+  await fd.read(nameBuffer, 0, nameLength, fileHeaderOffset + 30);
+  const name = nameBuffer.toString('utf-8');
+
+  if (fileLength === 0) {
+    return {
+      name,
+      filePath: sourcePath,
+      crc32: crc32,
+      offset: 0,
+      compressionMethod: 0,
+      compressedLength: 0,
+      length: 0
+    }
+  }
+
+  if (length === 0xFFFFFFFF || compressedLength === 0xFFFFFFFF) {
+    let zip64Pos = 4;
+    const zip64Buffer = Buffer.alloc(extraFieldLength);
+    await fd.read(zip64Buffer, 0, extraFieldLength, fileHeaderOffset + 30 + nameLength);
+
+    if (length === 0xFFFFFFFF) {
+      length = Number(zip64Buffer.readBigUInt64LE(zip64Pos));
+      zip64Pos += 8;
+    }
+
+    if (compressedLength === 0xFFFFFFFF) {
+      compressedLength = Number(zip64Buffer.readBigUInt64LE(zip64Pos));
+      zip64Pos += 8;
+    }
+  }
+
+  const trueOffset = fileHeaderOffset + 30 + nameLength + extraFieldLength;
+
+  // Just read the field sizes so we can get the accurate start point
+
+  return {
+    name,
+    filePath: sourcePath,
+    crc32: crc32,
+    compressionMethod,
+    compressedLength,
+    length,
+    offset: trueOffset,
+  }
+}
+
+export async function createStreamFromOffset(zipDataOffset: ZipDataOffset): Promise<ReadStream | null> {
+  if (zipDataOffset.length === 0) {
+    return null;
+  }
+
+  const stream = fs.createReadStream(zipDataOffset.filePath, {
+    start: zipDataOffset.offset,
+    end: Number(zipDataOffset.offset + zipDataOffset.compressedLength) - 1
+  });
+
+  // Pipe deflated data through inflate stream
+  if (zipDataOffset.compressionMethod === 8) {
+    const inflateStream = createInflateRaw();
+    stream.pipe(inflateStream);
+    return inflateStream as unknown as ReadStream;
+  }
+
+  // Store, pipe back raw data
+  return stream;
+}
